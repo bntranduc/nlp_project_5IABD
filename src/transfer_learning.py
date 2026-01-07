@@ -23,7 +23,7 @@ from datasets import Dataset
 
 # Configuration
 MODEL_NAME = "distilbert/distilbert-base-cased"
-TEXT_FIELD = "raw_log"  # or "description" if preferred
+TEXT_FIELD = "description"
 LABEL_FIELD = "severity"
 
 
@@ -138,7 +138,7 @@ def create_tokenized_datasets(sentences_train, sentences_dev, sentences_test,
     
     print("Tokenizing data...")
     def tokenize_function(examples):
-        return tokenizer(examples["text"], truncation=True, padding=True, max_length=max_length)
+        return tokenizer(examples["text"], truncation=True, max_length=max_length)
     
     # Create datasets
     train_dict = {"text": sentences_train, "labels": labels_train_encoded.tolist()}
@@ -234,47 +234,136 @@ def compute_metrics(eval_pred):
     
     # Calculate metrics using sklearn
     accuracy = accuracy_score(labels, predictions)
-    f1 = f1_score(labels, predictions, average="weighted")
+    f1_weighted = f1_score(labels, predictions, average="weighted")
+    f1_macro = f1_score(labels, predictions, average="macro")
     precision = precision_score(labels, predictions, average="weighted", zero_division=0)
     recall = recall_score(labels, predictions, average="weighted", zero_division=0)
     
     return {
         "accuracy": accuracy,
-        "f1": f1,
+        "f1_weighted": f1_weighted,
+        "f1_macro": f1_macro,
         "precision": precision,
         "recall": recall,
     }
 
+from torch.utils.data import WeightedRandomSampler, DataLoader
 
-def create_trainer(model, tokenizer, dataset_train, dataset_dev, 
-                   output_dir="./models/siem_severity_model",
-                   learning_rate=2e-5,
-                   per_device_train_batch_size=16,
-                   per_device_eval_batch_size=16,
-                   num_train_epochs=10,
-                   weight_decay=0.01,
-                   logging_dir="./logs",
-                   logging_steps=100):
+def create_stratified_sampler(labels_train_encoded):
     """
-    Crée le Trainer avec les arguments d'entraînement.
+    Crée un sampler stratifié pour équilibrer les batches pendant l'entraînement.
     
     Args:
-        model: Modèle à entraîner
-        tokenizer: Tokenizer
-        dataset_train: Dataset d'entraînement
-        dataset_dev: Dataset de dev
-        output_dir: Répertoire de sortie
-        learning_rate: Taux d'apprentissage
-        per_device_train_batch_size: Taille de batch d'entraînement
-        per_device_eval_batch_size: Taille de batch d'évaluation
-        num_train_epochs: Nombre d'époques
-        weight_decay: Décroissance du poids
-        logging_dir: Répertoire des logs
-        logging_steps: Fréquence des logs
+        labels_train_encoded: Labels encodés du train set
         
     Returns:
-        trainer
+        WeightedRandomSampler
     """
+    from collections import Counter
+    
+    # Compter les occurrences de chaque classe
+    class_counts = Counter(labels_train_encoded)
+    print(f"\nClass distribution in training set:")
+    for label, count in sorted(class_counts.items()):
+        print(f"  Class {label}: {count} samples ({100*count/len(labels_train_encoded):.2f}%)")
+    
+    # Calculer les poids pour chaque échantillon
+    # weight = 1 / count_of_class
+    class_weights = {label: 1.0 / count for label, count in class_counts.items()}
+    sample_weights = [class_weights[label] for label in labels_train_encoded]
+    
+    # Créer le sampler
+    sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True
+    )
+    
+    return sampler
+
+
+def create_trainer(model, tokenizer, dataset_train, dataset_dev, 
+                   labels_train_encoded,
+                   output_dir="./models/siem_severity_model",
+                   learning_rate=3e-5,
+                   per_device_train_batch_size=32,
+                   per_device_eval_batch_size=64,
+                   num_train_epochs=15,
+                   weight_decay=0.01,
+                   logging_dir="./logs",
+                   logging_steps=100,
+                   warmup_ratio=0.1,
+                   use_focal_loss=False,
+                   focal_gamma=2.0,
+                   weight_scaling=0.3,
+                   use_stratified_sampling=False):
+    """
+    Crée le Trainer avec class weights réduits, focal loss, et stratified sampling.
+    """
+    from sklearn.utils.class_weight import compute_class_weight
+    
+    # Calculer les class weights
+    class_weights = compute_class_weight(
+        class_weight='balanced',
+        classes=np.unique(labels_train_encoded),
+        y=labels_train_encoded
+    )
+    
+    # Réduire drastiquement les poids
+    class_weights_reduced = 1 + (class_weights - 1) * weight_scaling
+    class_weights_tensor = torch.FloatTensor(class_weights_reduced)
+    
+    print(f"\nClass weights (original): {class_weights}")
+    print(f"Class weights (reduced with scaling={weight_scaling}): {class_weights_reduced}")
+    
+    # Focal Loss
+    class FocalLoss(torch.nn.Module):
+        def __init__(self, alpha=None, gamma=2.0):
+            super().__init__()
+            self.alpha = alpha
+            self.gamma = gamma
+        
+        def forward(self, inputs, targets):
+            ce_loss = torch.nn.functional.cross_entropy(
+                inputs, targets, reduction='none', weight=self.alpha
+            )
+            pt = torch.exp(-ce_loss)
+            focal_loss = ((1 - pt) ** self.gamma * ce_loss).mean()
+            return focal_loss
+    
+    # STRATÉGIE 3: Stratified Sampling
+    train_sampler = None
+    if use_stratified_sampling:
+        print("\n🎯 Using stratified sampling for balanced batches")
+        train_sampler = create_stratified_sampler(labels_train_encoded)
+    
+    # Custom Trainer avec support du sampler
+    class WeightedTrainer(Trainer):
+        def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+            labels = inputs.pop("labels")
+            outputs = model(**inputs)
+            logits = outputs.logits
+            
+            if use_focal_loss:
+                loss_fct = FocalLoss(
+                    alpha=class_weights_tensor.to(model.device),
+                    gamma=focal_gamma
+                )
+                loss = loss_fct(logits, labels)
+            else:
+                loss_fct = torch.nn.CrossEntropyLoss(
+                    weight=class_weights_tensor.to(model.device)
+                )
+                loss = loss_fct(logits, labels)
+            
+            return (loss, outputs) if return_outputs else loss
+        
+        def _get_train_sampler(self, train_dataset):  # CORRECTION ICI: accepter train_dataset
+            """Override pour utiliser notre sampler stratifié."""
+            if train_sampler is not None:
+                return train_sampler
+            return super()._get_train_sampler(train_dataset)
+    
     # Data collator
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
     
@@ -286,16 +375,19 @@ def create_trainer(model, tokenizer, dataset_train, dataset_dev,
         per_device_eval_batch_size=per_device_eval_batch_size,
         num_train_epochs=num_train_epochs,
         weight_decay=weight_decay,
+        warmup_ratio=warmup_ratio,
+        lr_scheduler_type="cosine",
         eval_strategy="epoch",
         save_strategy="epoch",
         load_best_model_at_end=True,
+        metric_for_best_model="f1_macro",
         push_to_hub=False,
         logging_dir=logging_dir,
         logging_steps=logging_steps,
     )
     
-    # Initialize trainer
-    trainer = Trainer(
+    # Initialize WeightedTrainer
+    trainer = WeightedTrainer(
         model=model,
         args=training_args,
         train_dataset=dataset_train,
@@ -400,6 +492,8 @@ def main():
     # Configuration
     train_csv_path = "./data/raw/SIEM_Dataset/train.csv"
     test_csv_path = "./data/raw/SIEM_Dataset/test.csv"
+
+    print(f"Device : {torch.cuda.get_device_name(torch.cuda.current_device())}")
     
     # 1. Load data
     sentences_train_full, labels_train_full, sentences_test, labels_test = load_data_from_csv(
@@ -424,12 +518,21 @@ def main():
         labels_train_encoded, labels_dev_encoded, labels_test_encoded
     )
     
-    # 5. Create model
-    model = create_model(MODEL_NAME, num_labels, unfreeze_last_n_layers=1)
+    # 5. Create model with more unfrozen layers
+    model = create_model(MODEL_NAME, num_labels, unfreeze_last_n_layers=2)
     
-    # 6. Create trainer
+    # 6. Create trainer with class weights
     trainer = create_trainer(
-        model, tokenizer, dataset_train, dataset_dev
+        model, tokenizer, dataset_train, dataset_dev,
+        labels_train_encoded=labels_train_encoded,
+        learning_rate=3e-5,
+        per_device_train_batch_size=64,
+        per_device_eval_batch_size=64,
+        num_train_epochs=15,
+        warmup_ratio=0.1,
+        use_focal_loss=True,
+        focal_gamma=1.5,  # Gamma modéré (essayez 1.0, 1.5, 2.0)
+        weight_scaling=0.3,
     )
     
     # 7. Train model
